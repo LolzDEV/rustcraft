@@ -1,7 +1,10 @@
-use std::io::{Cursor, Write};
+use std::{io::{Cursor, Write, self}, string::FromUtf8Error};
 
 use mc_varint::{VarInt, VarIntRead, VarIntWrite};
-use openssl::{pkey::Private, rsa::Rsa};
+use rsa::{RsaPublicKey, pkcs8::ToPublicKey};
+use uuid::Uuid;
+
+pub mod play;
 
 pub fn read_string(cursor: &mut Cursor<Vec<u8>>) -> String {
     let lenght: i32 = cursor.read_var_int().unwrap().into();
@@ -86,6 +89,7 @@ impl Handshake {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct EncryptionRequest {
     pub id: Vec<u8>,
     pub key_length: i32,
@@ -95,9 +99,9 @@ pub struct EncryptionRequest {
 }
 
 impl EncryptionRequest {
-    pub fn new(key: Rsa<Private>) -> (Self, Vec<u8>) {
-        let key = key.public_key_to_der().unwrap();
-        let id = write_string(String::from_utf8(vec![0, 0, 0, 0, 0]).unwrap());
+    pub fn new(key: RsaPublicKey) -> (Self, Vec<u8>) {
+        let key = key.to_public_key_der().unwrap().as_ref().to_vec();
+        let id = write_string(String::from_utf8(vec![0u8; 19]).unwrap());
         let key_length = key.len() as i32;
         let token_length = 4;
         let token: Vec<u8> = (0..4).map(|_| rand::random::<u8>()).collect();
@@ -115,6 +119,7 @@ impl EncryptionRequest {
         let mut cursor = Cursor::new(Vec::with_capacity(10));
 
         cursor.write_var_int(VarInt::from(0x01)).unwrap();
+        cursor.write_var_int(VarInt::from(self.id.len() as i32)).unwrap();
         cursor.write(self.id.as_slice()).unwrap();
         cursor.write_var_int(VarInt::from(self.key_length)).unwrap();
         cursor.write(self.key.as_slice()).unwrap();
@@ -151,5 +156,114 @@ impl EncryptionResponse {
             token_length,
             token
         }
+    }
+}
+
+pub struct LoginSuccess {
+    pub uuid: Vec<u8>,
+    pub user: String
+}
+
+impl LoginSuccess {
+    pub fn new(uuid: Uuid, user: String) -> Self {
+        let id = uuid.as_u128().to_le_bytes().to_vec();
+
+        Self {
+            uuid: id,
+            user
+        }
+    }
+
+    pub fn encode(self) -> Vec<u8> {
+        let mut res = Vec::new();
+
+        let mut cursor = Cursor::new(Vec::with_capacity(20));
+        cursor.write_var_int(VarInt::from(0x02)).unwrap();
+        cursor.write(self.uuid.as_slice()).unwrap();
+        cursor.write(write_string(self.user).as_slice()).unwrap();
+        
+        res.write_var_int(VarInt::from(cursor.get_ref().len() as i32)).unwrap();
+        res.append(&mut cursor.get_mut().to_vec());
+
+        res
+    }
+}
+
+pub struct PacketBuf {
+    pub content: Vec<u8>,
+    pub position: u64,
+    pub id: i32
+}
+
+impl PacketBuf {
+    pub fn new(id: i32) -> Self {
+        Self {
+            content: Vec::new(),
+            position: 0,
+            id
+        }
+    }
+
+    pub fn decode(data: Vec<u8>) -> io::Result<PacketBuf> {
+        let mut packet = PacketBuf { content: data, position: 0, id: 0 };
+
+        let _size = packet.read_var_int()?;
+        packet.id = packet.read_var_int()?;
+
+        Ok(packet)
+    }
+
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        let mut res = Vec::new();
+        let mut cont = Vec::new();
+        cont.write_var_int(VarInt::from(self.id))?; // Write the packet id
+        cont.append(&mut self.content.clone()); // Write the content
+        
+        res.write_var_int(VarInt::from(cont.len() as i32))?; // Write the packet size
+        res.append(&mut cont);
+
+        Ok(res)
+    }
+
+    pub fn write_var_int(&mut self, value: i32) -> io::Result<()> {
+        self.content.write_var_int(VarInt::from(value))?;
+
+        Ok(())
+    }
+
+    pub fn read_var_int(&mut self) -> io::Result<i32> {
+        let mut cursor = Cursor::new(&self.content);
+        cursor.set_position(self.position);
+
+        let value: i32 = cursor.read_var_int()?.into();
+
+        self.position = cursor.position();
+
+        Ok(value)
+    }
+    
+    pub fn write_string(&mut self, value: String) -> io::Result<()> {
+        self.content.write(&write_string(value))?;
+
+        Ok(())
+    }
+
+    pub fn read_string(&mut self) -> Result<String, FromUtf8Error> {
+        let mut cursor = Cursor::new(&self.content);
+        cursor.set_position(self.position);
+
+        let lenght: i32 = cursor.read_var_int().unwrap().into();
+        let pos = cursor.position();
+
+        let mut value = Vec::new();
+
+        while cursor.position() < pos + lenght as u64 {
+            value.push(cursor.get_ref()[cursor.position() as usize]);
+            cursor.set_position(cursor.position() + 1);
+        }
+        
+        self.position = cursor.position();
+
+        String::from_utf8(value)
     }
 }

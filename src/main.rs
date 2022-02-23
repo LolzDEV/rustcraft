@@ -1,4 +1,3 @@
-//TODO: Fix packets with vectors
 
 use std::{
     io::{Cursor, Read, Write, BufReader, BufWriter},
@@ -6,21 +5,28 @@ use std::{
     thread, vec,
 };
 
+
 use mc_varint::{VarInt, VarIntRead, VarIntWrite};
-use openssl::{pkey::Private, rsa::{Rsa, Padding}};
+use num_bigint::BigInt;
 use packets::Handshake;
+use rand::rngs::OsRng;
+use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::{ToPublicKey}};
+use sha1::{Sha1, Digest};
+use uuid::Uuid;
 
 use crate::{
-    packets::{read_i64, read_string, write_string, EncryptionRequest, EncryptionResponse},
-    server_list::{Player, ServerList, Version},
+    packets::{read_i64, read_string, write_string, EncryptionRequest, EncryptionResponse, LoginSuccess},
+    server_list::{Player, ServerList, Version}, login::AuthRespone,
 };
 
 mod packets;
 mod server_list;
+mod login;
+mod play;
 
 const PROTOCOL: i32 = 757;
 
-fn handle_client(mut stream: TcpStream, rsa: Rsa<Private>) {
+fn handle_client(stream: TcpStream, public_key: RsaPublicKey, private_key: RsaPrivateKey) {
     let mut reader = BufReader::new(&stream);
     let mut writer = BufWriter::new(&stream);
 
@@ -79,8 +85,8 @@ fn handle_client(mut stream: TcpStream, rsa: Rsa<Private>) {
             writer.flush().unwrap();
 
 
-            let packet_size: i32 = reader.read_var_int().unwrap().into();
-            let packet_size: i32 = reader.read_var_int().unwrap().into();
+            reader.read_var_int().unwrap();
+            reader.read_var_int().unwrap();
             let packet_size: i32 = reader.read_var_int().unwrap().into();
     
             let mut data = vec![0; packet_size as usize];
@@ -123,9 +129,9 @@ fn handle_client(mut stream: TcpStream, rsa: Rsa<Private>) {
                 println!("Received connection request from: {}", user);
                 println!("Sending encryption request...");
 
-                let (request, token) = EncryptionRequest::new(rsa.clone());
+                let (request, token) = EncryptionRequest::new(public_key.clone());
 
-                writer.write(request.encode().as_slice()).unwrap();
+                writer.write(request.clone().encode().as_slice()).unwrap();
 
                 writer.flush().unwrap();
 
@@ -143,13 +149,35 @@ fn handle_client(mut stream: TcpStream, rsa: Rsa<Private>) {
 
                         let response = EncryptionResponse::new(&mut cursor);
 
-                        let mut decr = vec![0u8; response.token_length as usize];
-
-                        println!("Encrypted token: {:?}", response.token);
-
-                        rsa.public_decrypt(response.token.as_slice(), &mut decr, Padding::PKCS1).unwrap();
-                        println!("Decrypted token: {:?}", decr);
+                        let decr = private_key.decrypt(rsa::PaddingScheme::PKCS1v15Encrypt, &response.token).unwrap();
                         
+
+                        if decr != token {
+                            println!("Login failed!");
+                        }
+
+                        let shared_secret = private_key.decrypt(rsa::PaddingScheme::PKCS1v15Encrypt, &response.secret).unwrap();
+
+                        let mut hash = Sha1::new();
+                        hash.update(request.id.as_slice().to_ascii_lowercase());
+                        hash.update(shared_secret);
+                        hash.update(public_key.to_public_key_der().unwrap().as_ref());
+
+                        let hex = BigInt::from_signed_bytes_be(hash.finalize().as_slice()).to_str_radix(16);
+
+                        let mut res = reqwest::blocking::get(&format!("https://sessionserver.mojang.com/session/minecraft/hasJoined?username={user}&serverId={hex}")).unwrap();
+                    
+                        let mut cont = String::new();
+                        res.read_to_string(&mut cont).unwrap();
+
+                        let auth_response: AuthRespone = serde_json::from_str(&cont).unwrap();
+
+                        let uuid = Uuid::parse_str(&auth_response.id).unwrap();
+
+                        let success = LoginSuccess::new(uuid, user);
+
+                        writer.write(success.encode().as_slice()).unwrap();
+                        writer.flush().unwrap();
                     }
                 }
             }
@@ -181,16 +209,19 @@ fn handle_client(mut stream: TcpStream, rsa: Rsa<Private>) {
 
 fn main() {
     println!("Generating RSA key...");
-    let rsa = Rsa::generate(1024).unwrap();
+    let mut rng = OsRng;
+    let priv_key = RsaPrivateKey::new(&mut rng, 1024).unwrap();
+    let pub_key = RsaPublicKey::from(&priv_key);
 
     let listener = TcpListener::bind("0.0.0.0:25565").unwrap();
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let rsa = rsa.clone();
+                let public = pub_key.clone();
+                let private = priv_key.clone();
                 thread::spawn(move || {
-                    handle_client(stream, rsa);
+                    handle_client(stream, public, private);
                 });
             }
             Err(e) => eprintln!("Failed to connect, {}", e),
