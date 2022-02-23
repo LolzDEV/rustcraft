@@ -1,7 +1,9 @@
+//TODO: Fix packets with vectors
+
 use std::{
     io::{Cursor, Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
-    thread,
+    thread, vec,
 };
 
 use mc_varint::{VarInt, VarIntRead, VarIntWrite};
@@ -9,7 +11,7 @@ use openssl::{pkey::Private, rsa::Rsa};
 use packets::Handshake;
 
 use crate::{
-    packets::{read_i64, read_string, write_string},
+    packets::{read_i64, read_string, write_string, EncryptionRequest},
     server_list::{Player, ServerList, Version},
 };
 
@@ -19,12 +21,13 @@ mod server_list;
 const PROTOCOL: i32 = 757;
 
 fn handle_client(mut stream: TcpStream, rsa: Rsa<Private>) {
-    let mut data = [0 as u8; 50];
+    let packet_size: i32 = stream.read_var_int().unwrap().into();
+    let packet_id: i32 = stream.read_var_int().unwrap().into();
 
+    let mut data = vec![0; packet_size as usize];
     stream.read(&mut data).unwrap();
+
     let mut cursor = Cursor::new(data);
-    let _packet_size: i32 = cursor.read_var_int().unwrap().into();
-    let packet_id: i32 = cursor.read_var_int().unwrap().into();
 
     let handshake;
 
@@ -69,13 +72,18 @@ fn handle_client(mut stream: TcpStream, rsa: Rsa<Private>) {
 
             stream.write(res.as_slice()).unwrap();
 
+            stream.flush().unwrap();
+
+            let packet_size: i32 = stream.read_var_int().unwrap().into();
+            let packet_id: i32 = stream.read_var_int().unwrap().into();
+            
+            println!("{}", packet_size);
+
+            let mut data = vec![0; packet_size as usize];
             if let Ok(_) = stream.read(&mut data) {
                 let mut cursor = Cursor::new(data);
-
-                let packet_size: i32 = cursor.read_var_int().unwrap().into();
-                let packet_id: i32 = cursor.read_var_int().unwrap().into();
-
                 if packet_id == 0x01 {
+                    println!("Got ping");
                     let numb = read_i64(&mut cursor);
 
                     let mut cursor = Cursor::new(Vec::with_capacity(10));
@@ -92,19 +100,42 @@ fn handle_client(mut stream: TcpStream, rsa: Rsa<Private>) {
             }
         }
 
-        if let Ok(_) = stream.read(&mut data) {
+        if handshake.next_state == 2 {
+            println!("Login stage");
+            let packet_size: i32 = stream.read_var_int().unwrap().into();
+            let packet_id: i32 = stream.read_var_int().unwrap().into();
+            
+            let mut data = vec![0; packet_size as usize];
+            stream.read(&mut data).unwrap();
+            println!("Read");
             let mut cursor = Cursor::new(data);
-            let _packet_size: i32 = cursor.read_var_int().unwrap().into();
-            let packet_id: i32 = cursor.read_var_int().unwrap().into();
 
             if packet_id == 0x00 {
                 let user = read_string(&mut cursor);
 
                 println!("Received connection request from: {}", user);
+                println!("Sending encryption request...");
+
+                let request = EncryptionRequest::new(rsa);
+
+                stream.write(request.encode().as_slice()).unwrap();
+
+                let packet_size: i32 = stream.read_var_int().unwrap().into();
+                let packet_id: i32 = stream.read_var_int().unwrap().into();
+            
+                let mut data = vec![0; packet_size as usize];
+                if let Ok(_) = stream.read(&mut data) {
+                    let mut cursor = Cursor::new(data);
+
+                    if packet_id == 0x01 {
+                        println!("Got encrypt response");
+                    }
+                }
             }
         }
     }
 
+    /*
     while match stream.read(&mut data) {
         Ok(_size) => {
             let mut cursor = Cursor::new(data);
@@ -123,6 +154,7 @@ fn handle_client(mut stream: TcpStream, rsa: Rsa<Private>) {
             false
         }
     } {}
+    */
 }
 
 fn main() {
@@ -134,6 +166,7 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                let rsa = rsa.clone();
                 thread::spawn(move || {
                     handle_client(stream, rsa);
                 });
