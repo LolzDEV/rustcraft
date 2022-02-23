@@ -95,33 +95,36 @@ pub struct EncryptionRequest {
 }
 
 impl EncryptionRequest {
-    pub fn new(key: Rsa<Private>) -> Self {
+    pub fn new(key: Rsa<Private>) -> (Self, Vec<u8>) {
         let key = key.public_key_to_der().unwrap();
         let id = write_string(String::from_utf8(vec![0, 0, 0, 0, 0]).unwrap());
         let key_length = key.len() as i32;
         let token_length = 4;
         let token: Vec<u8> = (0..4).map(|_| rand::random::<u8>()).collect();
 
-        Self {
+        (Self {
             id,
             key_length,
             key,
-            token,
+            token: token.clone(),
             token_length
-        }
+        }, token)
     }
 
     pub fn encode(self) -> Vec<u8> {
         let mut cursor = Cursor::new(Vec::with_capacity(10));
 
         cursor.write_var_int(VarInt::from(0x01)).unwrap();
-        cursor.write_var_int(VarInt::from(self.id.len() as i32 + self.key_length + self.token_length + 4)).unwrap();
+        cursor.write(self.id.as_slice()).unwrap();
         cursor.write_var_int(VarInt::from(self.key_length)).unwrap();
         cursor.write(self.key.as_slice()).unwrap();
         cursor.write_var_int(VarInt::from(self.token_length)).unwrap();
         cursor.write(self.token.as_slice()).unwrap();
 
+        let size = cursor.get_ref().to_vec().len();
+
         let mut result = Vec::new();
+        result.write_var_int(VarInt::from(size as i32)).unwrap();
         result.append(cursor.get_mut());
 
         result
@@ -136,12 +139,11 @@ pub struct EncryptionResponse {
 }
 
 impl EncryptionResponse {
-    pub fn new(data: Vec<u8>) -> Self {
-        let mut cursor = Cursor::new(data);
+    pub fn new(cursor: &mut Cursor<Vec<u8>>) -> Self {
         let secret_length: i32 = cursor.read_var_int().unwrap().into();
-        let secret = read_bytes(&mut cursor, secret_length as usize);
+        let secret = read_bytes(cursor, secret_length as usize);
         let token_length: i32 = cursor.read_var_int().unwrap().into();
-        let token = read_bytes(&mut cursor, token_length as usize);
+        let token = read_bytes(cursor, token_length as usize);
 
         Self {
             secret_length,

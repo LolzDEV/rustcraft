@@ -1,17 +1,17 @@
 //TODO: Fix packets with vectors
 
 use std::{
-    io::{Cursor, Read, Write},
-    net::{Shutdown, TcpListener, TcpStream},
+    io::{Cursor, Read, Write, BufReader, BufWriter},
+    net::{TcpListener, TcpStream},
     thread, vec,
 };
 
 use mc_varint::{VarInt, VarIntRead, VarIntWrite};
-use openssl::{pkey::Private, rsa::Rsa};
+use openssl::{pkey::Private, rsa::{Rsa, Padding}};
 use packets::Handshake;
 
 use crate::{
-    packets::{read_i64, read_string, write_string, EncryptionRequest},
+    packets::{read_i64, read_string, write_string, EncryptionRequest, EncryptionResponse},
     server_list::{Player, ServerList, Version},
 };
 
@@ -21,13 +21,17 @@ mod server_list;
 const PROTOCOL: i32 = 757;
 
 fn handle_client(mut stream: TcpStream, rsa: Rsa<Private>) {
-    let packet_size: i32 = stream.read_var_int().unwrap().into();
-    let packet_id: i32 = stream.read_var_int().unwrap().into();
+    let mut reader = BufReader::new(&stream);
+    let mut writer = BufWriter::new(&stream);
+
+    let packet_size: i32 = reader.read_var_int().unwrap().into();
 
     let mut data = vec![0; packet_size as usize];
-    stream.read(&mut data).unwrap();
+    reader.read(&mut data).unwrap();
 
     let mut cursor = Cursor::new(data);
+
+    let packet_id: i32 = cursor.read_var_int().unwrap().into();
 
     let handshake;
 
@@ -70,20 +74,23 @@ fn handle_client(mut stream: TcpStream, rsa: Rsa<Private>) {
 
             res.append(&mut write_string(list));
 
-            stream.write(res.as_slice()).unwrap();
+            writer.write(res.as_slice()).unwrap();
 
-            stream.flush().unwrap();
+            writer.flush().unwrap();
 
-            let packet_size: i32 = stream.read_var_int().unwrap().into();
-            let packet_id: i32 = stream.read_var_int().unwrap().into();
-            
-            println!("{}", packet_size);
 
+            let packet_size: i32 = reader.read_var_int().unwrap().into();
+            let packet_size: i32 = reader.read_var_int().unwrap().into();
+            let packet_size: i32 = reader.read_var_int().unwrap().into();
+    
             let mut data = vec![0; packet_size as usize];
-            if let Ok(_) = stream.read(&mut data) {
+            if let Ok(_) = reader.read(&mut data) {
+                println!("{}", data.len());
                 let mut cursor = Cursor::new(data);
+                let packet_id: i32 = cursor.read_var_int().unwrap().into();
+
+                println!("{}", packet_id);
                 if packet_id == 0x01 {
-                    println!("Got ping");
                     let numb = read_i64(&mut cursor);
 
                     let mut cursor = Cursor::new(Vec::with_capacity(10));
@@ -95,20 +102,20 @@ fn handle_client(mut stream: TcpStream, rsa: Rsa<Private>) {
                     res.append(cursor.get_mut());
                     res.append(&mut numb.to_le_bytes().to_vec());
 
-                    stream.write(res.as_slice()).unwrap();
+                    writer.write(res.as_slice()).unwrap();
+                    writer.flush().unwrap();
                 }
             }
         }
 
         if handshake.next_state == 2 {
             println!("Login stage");
-            let packet_size: i32 = stream.read_var_int().unwrap().into();
-            let packet_id: i32 = stream.read_var_int().unwrap().into();
+            let packet_size: i32 = reader.read_var_int().unwrap().into();
             
             let mut data = vec![0; packet_size as usize];
-            stream.read(&mut data).unwrap();
-            println!("Read");
+            reader.read(&mut data).unwrap();
             let mut cursor = Cursor::new(data);
+            let packet_id: i32 = cursor.read_var_int().unwrap().into();
 
             if packet_id == 0x00 {
                 let user = read_string(&mut cursor);
@@ -116,23 +123,38 @@ fn handle_client(mut stream: TcpStream, rsa: Rsa<Private>) {
                 println!("Received connection request from: {}", user);
                 println!("Sending encryption request...");
 
-                let request = EncryptionRequest::new(rsa);
+                let (request, token) = EncryptionRequest::new(rsa.clone());
 
-                stream.write(request.encode().as_slice()).unwrap();
+                writer.write(request.encode().as_slice()).unwrap();
 
-                let packet_size: i32 = stream.read_var_int().unwrap().into();
-                let packet_id: i32 = stream.read_var_int().unwrap().into();
+                writer.flush().unwrap();
+
+                let packet_size: i32 = reader.read_var_int().unwrap().into();
+
+                println!("{}", packet_size);
             
                 let mut data = vec![0; packet_size as usize];
-                if let Ok(_) = stream.read(&mut data) {
+                if let Ok(_) = reader.read(&mut data) {
                     let mut cursor = Cursor::new(data);
+                    let packet_id: i32 = cursor.read_var_int().unwrap().into();
 
                     if packet_id == 0x01 {
                         println!("Got encrypt response");
+
+                        let response = EncryptionResponse::new(&mut cursor);
+
+                        let mut decr = vec![0u8; response.token_length as usize];
+
+                        println!("Encrypted token: {:?}", response.token);
+
+                        rsa.public_decrypt(response.token.as_slice(), &mut decr, Padding::PKCS1).unwrap();
+                        println!("Decrypted token: {:?}", decr);
+                        
                     }
                 }
             }
         }
+        
     }
 
     /*
